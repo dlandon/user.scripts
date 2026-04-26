@@ -30,6 +30,7 @@ switch ($_POST['action']) {
 
 		echo $newPath;
 		break;
+
 	case 'directRunScript':
 		$path = isset($_POST['path']) ? urldecode(($_POST['path'])) : "";
 		$variables = getScriptVariables($path);
@@ -49,6 +50,7 @@ switch ($_POST['action']) {
 		$goodPath = str_replace("/usr/local/emhttp","",$newPath);
 		echo $goodPath.".php";
 		break;
+
 	case 'checkBackground':
 		$allScripts = @array_diff(@scandir("/boot/config/plugins/user.scripts/scripts"),array(".",".."));
 		if ( ! $allScripts ) {
@@ -112,24 +114,76 @@ switch ($_POST['action']) {
 		$o .= "</script>";
 		echo $o;
 		break;
+
 	case 'abortScript':
-		$script = isset($_POST['name']) ? urldecode(($_POST['name'])) : "";
-		
-		$pid = file_get_contents("/tmp/user.scripts/running/$script");
-		exec("pkill -TERM -P $pid");
-		exec("kill -9 $pid");
-		$processListOutput = null;
-		exec("ps aux | grep -i '/tmp/user.scripts/tmpScripts/$script' | grep -v grep", $processListOutput);
-		foreach ($processListOutput as $emergencyKill) {
-			$emergencyKill = str_replace("root","",$emergencyKill);
-			$emergencyKill = trim($emergencyKill);
-			$rawKill = explode(" ",$emergencyKill);
-			logger("Kill pid: ".$rawKill[0]);
-			exec("kill -9 ".$rawKill[0]);
+		$script = isset($_POST['name']) ? urldecode($_POST['name']) : "";
+		$pidFile = "/tmp/user.scripts/running/$script";
+		$pgid = 0;
+		$i = 0;
+		$ret = 1;
+		$is_running = false;
+		$dummy = [];
+		$processListOutput = [];
+
+		if (! file_exists($pidFile)) break;
+
+		$pgid = (int)trim((string)@file_get_contents($pidFile));
+		if ($pgid <= 0) {
+			@unlink($pidFile);
+			break;
 		}
-		@unlink("/tmp/user.scripts/running/$script");
-		file_put_contents("/tmp/user.scripts/finished/$script","aborted");
-		file_put_contents("/tmp/user.scripts/tmpScripts/$script/log.txt","Execution was aborted by user\n\n",FILE_APPEND);
+
+		/* Send TERM to entire process group */
+		exec("kill -TERM -$pgid 2>/dev/null");
+
+		/* Wait up to 10 seconds for group to exit */
+		while ($i < 10) {
+			$is_running = false;
+
+			if (function_exists('posix_kill')) {
+				$is_running = @posix_kill($pgid, 0);
+			} else {
+				exec("kill -0 $pgid 2>/dev/null", $dummy, $ret);
+				$is_running = ($ret === 0);
+			}
+
+			if (! $is_running) {
+				break;
+			}
+
+			sleep(1);
+			$i++;
+		}
+
+		/* Force kill remaining processes in the group */
+		$is_running = false;
+		if (function_exists('posix_kill')) {
+			$is_running = @posix_kill($pgid, 0);
+		} else {
+			exec("kill -0 $pgid 2>/dev/null", $dummy, $ret);
+			$is_running = ($ret === 0);
+		}
+
+		if ($is_running) {
+			exec("kill -9 -$pgid 2>/dev/null");
+		}
+
+		/* Emergency check: catch any leftover processes by script path */
+		exec("ps aux | grep -F " . escapeshellarg("/tmp/user.scripts/tmpScripts/$script") . " | grep -v grep", $processListOutput);
+		foreach ($processListOutput as $emergencyKill) {
+			$emergencyKill = trim(preg_replace('/\s+/', ' ', $emergencyKill));
+			$rawKill = explode(" ", $emergencyKill);
+			if (! empty($rawKill[1]) && ctype_digit($rawKill[1])) {
+				logger("Kill leftover pid: ".$rawKill[1]);
+				exec("kill -9 ".$rawKill[1]." 2>/dev/null");
+			}
+		}
+
+		/* Cleanup */
+		@unlink($pidFile);
+		file_put_contents("/tmp/user.scripts/finished/$script", "aborted");
+		file_put_contents("/tmp/user.scripts/tmpScripts/$script/log.txt", "Execution was aborted by user\n\n", FILE_APPEND);
+
 		break;
 
 	case 'deleteLog':
